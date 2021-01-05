@@ -1,0 +1,176 @@
+{-
+
+N.B.
+
+This version is NOT WORKING
+
+Implementation: like v2, but simpler
+
+Pros:
+ - see v2
+
+Cons:
+ - Doesn't work lol
+   Issue is that the cached HTML has cached
+   event handlers, too, which when fired updates
+   the state to a modification of an old version.
+   Fixed in v2.
+
+-}
+
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE LambdaCase #-}
+
+module Main where
+
+import Data.Functor ((<&>))
+import Data.Function (on, (&))
+import Data.Maybe (isJust)
+
+import Miso hiding (on)
+import Miso.String
+
+import Debug.Trace
+
+data Expr = Literal Float | Operation Expr Op Expr deriving (Show, Eq)
+data Op = Plus | Minus | Times | Divide deriving (Show, Eq)
+
+eval :: Expr -> Float
+eval (Literal x) = x
+eval (Operation lhs op rhs) = (eval lhs) `fun` (eval rhs)
+  where fun = case op of
+          Plus -> (+)
+          Minus -> (-)
+          Times -> (*)
+          Divide -> (/)
+
+data Expr'
+  = Literal' Float (Maybe (View Expr'))
+  | Operation' Expr' Op' Expr' (Maybe (View Expr'))
+
+data Op' = Op' Op (Maybe (View Expr'))
+
+instance Show Expr' where
+  show (Literal' x prev) = "Literal' " <> show x <> " " <> showPrev prev
+  show (Operation' lhs' op' rhs' prev) = "Operation' (" <> show lhs' <> ") (" <> show op' <> ") (" <> show rhs' <> ") " <> showPrev prev
+
+instance Show Op' where
+  show (Op' op prev) = "Op' " <> show op <> " " <> showPrev prev
+
+showPrev prev = case prev of
+  Just _ -> "(Just ?)"
+  Nothing -> "Nothing"
+
+class Inj to from where
+  to :: from -> to
+
+instance Inj Expr Expr' where
+  to (Literal' x _) = Literal x
+  to (Operation' lhs' op' rhs' _) = Operation (to lhs') (to op') (to rhs')
+
+instance Inj Op Op' where
+  to (Op' op _) = op
+
+class Prime prime where
+  unchanged :: prime -> Bool
+  previous :: prime -> View Expr'
+  setPrevious :: View Expr' -> prime -> prime
+
+instance Prime Expr' where
+  unchanged (Literal' _ prev) = isJust prev
+  unchanged (Operation' lhs' op' rhs' prev) = isJust prev && unchanged lhs' && unchanged op' && unchanged rhs'
+  previous (Literal' _ (Just prev)) = prev
+  setPrevious prev (Literal' x _) = (Literal' x (Just prev))
+
+instance Prime Op' where
+  unchanged (Op' _ prev) = isJust prev
+  previous (Op' _ (Just prev)) = prev
+  setPrevious prev (Op' op _) = Op' op (Just prev)
+
+instance Eq Expr' where
+  (==) = (==) `on` (to :: Expr' -> Expr)
+
+instance Eq Op' where
+  (==) = (==) `on` (to :: Op' -> Op)
+
+type Model = Expr'
+
+main :: IO ()
+main = startApp App
+  { initialAction = initialModel
+  , model = initialModel
+  , update = \expr' _ -> return (traceShowId expr')
+  , view = viewTop
+  , events = defaultEvents
+  , subs = []
+  , mountPoint = Nothing
+  , logLevel = Off
+  }
+  where
+    initialModel = Literal' 0 Nothing
+
+viewTop :: Expr' -> View Expr'
+viewTop expr' =
+  div_ []
+    [ link_ [ rel_ "stylesheet", href_ "../../../main.css" ]
+    , viewExpr' id expr'
+    , text " = "
+    , text . toMisoString . show $ eval (expr' & to @Expr)
+    ]
+
+viewExpr' :: (Expr' -> Expr') -> Expr' -> View Expr'
+
+viewExpr' nestle literal'@(Literal' x _)
+  | unchanged literal' = trace "cache used" $ previous literal'
+  | otherwise =
+    span_ [ class_ "number" ]
+      [ input_ [ type_ "number"
+               , value_ (toMisoString $ show x)
+               , onChange (nestle <$> \s -> Literal' (read $ fromMisoString s) Nothing)
+               ]
+      , text " "
+      , button_ [ onClick (nestle $ Operation' literal' (Op' Plus Nothing) literal' Nothing) ] []
+      ]
+
+viewExpr' nestle operation'@(Operation' lhs' op' rhs' _)
+  | unchanged operation' = trace "cache used" $ previous operation'
+  | otherwise =
+    html where
+      html = span_ [ class_ "parens" ] [ lhsHtml, text " ", opHtml, text " ", rhsHtml ]
+
+      lhsHtml = viewExpr' (nestle <$> \l -> Operation' l setOp' setRhs' (Just html)) lhs'
+      opHtml = viewOp' (nestle <$> \o -> Operation' setLhs' o setRhs' (Just html)) op'
+      rhsHtml = viewExpr' (nestle <$> \r -> Operation' setLhs' setOp' r (Just html)) rhs'
+
+      setLhs' = lhs' & setPrevious lhsHtml
+      setOp' = op' & setPrevious opHtml
+      setRhs' = rhs' & setPrevious rhsHtml
+
+viewOp' :: (Op' -> Expr') -> Op' -> View Expr'
+viewOp' nestle op'
+  | unchanged op' = trace "cache used" $ previous op'
+  | otherwise =
+    select_
+      [ onChange (nestle <$> \s -> unstringify $ fromMisoString s) ]
+      ([Plus, Minus, Times, Divide] <&> \op ->
+        option_ [ selected_ (op == to op')
+                , value_ (toMisoString $ stringify op)
+                ]
+                [ text . toMisoString . stringify $ op ])
+    where
+      stringify :: Op -> String
+      stringify = \case
+        Plus -> "+"
+        Minus -> "-"
+        Times -> "×"
+        Divide -> "÷"
+
+      unstringify :: String -> Op'
+      unstringify = \case
+        "+" -> Op' Plus Nothing
+        "-" -> Op' Minus Nothing
+        "×" -> Op' Times Nothing
+        "÷" -> Op' Divide Nothing

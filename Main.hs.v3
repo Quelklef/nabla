@@ -1,0 +1,206 @@
+{-
+
+N.B.
+
+This version is VACUOUSLY WORKING.
+
+Implementation: not actually implemented; no caching
+happens at all. However, there is a bunch of code which
+sets up for caching, to be used in v4.
+
+-}
+
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE ExplicitForAll #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE LambdaCase #-}
+
+module Main where
+
+import Control.Monad (when)
+import Data.Functor ((<&>))
+import Data.Function (on, (&))
+import Data.Maybe (isJust, fromJust)
+import qualified Data.Map as Map
+import Data.Map (Map)
+import Data.IORef (IORef, newIORef, writeIORef, readIORef, modifyIORef)
+
+import Miso hiding (on)
+import Miso.String
+
+import Debug.Trace
+
+data Expr = Literal Float | Operation Expr Op Expr deriving (Show, Eq)
+data Op = Add | Sub | Mul | Div deriving (Show, Eq)
+
+eval :: Expr -> Float
+eval (Literal x) = x
+eval (Operation lhs op rhs) = (eval lhs) `fun` (eval rhs)
+  where fun = case op of
+          Add -> (+)
+          Sub -> (-)
+          Mul -> (*)
+          Div -> (/)
+
+data Expr'
+  = Literal' Float Changedness
+  | Operation' Expr' Op' Expr' Changedness
+  deriving (Show, Eq)
+
+data Op'
+  = Add' Changedness
+  | Sub' Changedness
+  | Mul' Changedness
+  | Div' Changedness
+  deriving (Show, Eq)
+
+data Changedness = Changed | Unchanged
+  deriving (Show, Eq)
+
+class Nabla nabla where
+  changedness :: nabla -> Changedness
+  same :: nabla -> nabla  -- recursively let changedness = Unchanged
+
+class Nabla nabla => NablaFor base nabla where
+  base :: nabla -> base
+
+wasChanged :: Nabla nabla => nabla -> Bool
+wasChanged = changedness <&> (== Changed)
+
+wasn'tChanged :: Nabla nabla => nabla -> Bool
+wasn'tChanged = not . wasChanged
+
+instance Nabla Expr' where
+  changedness (Literal' _ c) = c
+  changedness (Operation' _ _ _ c) = c
+
+  same (Literal' x _) = Literal' x Unchanged
+  same (Operation' lhs' op' rhs' _) = Operation' (same lhs') (same op') (same rhs') Unchanged
+
+instance NablaFor Expr Expr' where
+  base (Literal' x _) = Literal x
+  base (Operation' lhs' op' rhs' _) = Operation (base lhs') (base op') (base rhs')
+
+instance Nabla Op' where
+  changedness (Add' c) = c
+  changedness (Sub' c) = c
+  changedness (Mul' c) = c
+  changedness (Div' c) = c
+
+  same (Add' _) = Add' Unchanged
+  same (Sub' _) = Sub' Unchanged
+  same (Mul' _) = Mul' Unchanged
+  same (Div' _) = Div' Unchanged
+
+instance NablaFor Op Op' where
+  base (Add' _) = Add
+  base (Sub' _) = Sub
+  base (Mul' _) = Mul
+  base (Div' _) = Div
+
+main :: IO ()
+main = startApp App
+  { initialAction = id
+  , model = initialModel
+  , update = \step model -> return (traceShowId $ step model)
+  , view = viewTop
+  , events = defaultEvents
+  , subs = []
+  , mountPoint = Nothing
+  , logLevel = Off
+  }
+  where
+    initialModel = Literal' 0 Changed
+
+type Step a = a -> a
+type Nestle here there = Step here -> Step there
+type Html = View (Step Expr')
+
+data (-%>) p r = Fruitfly
+  { ffRun :: p -> IO r
+  , ffShift :: IO ()
+  }
+
+nablafly :: forall base nabla r. (NablaFor base nabla, Ord base) => (nabla -> r) -> IO (nabla -%> r)
+nablafly func = do
+  putCacheRef :: IORef (Map base r) <- newIORef Map.empty
+  getCacheRef :: IORef (Map base r) <- newIORef Map.empty
+
+  return $ Fruitfly
+    { ffRun = \param -> do
+        result <-
+          if wasn'tChanged param
+          then readIORef getCacheRef <&> confidentLookup (base param)
+          else return $ func param
+        modifyIORef putCacheRef (Map.insert (base param) result)
+        return result
+
+    , ffShift = do
+        writeIORef getCacheRef =<< readIORef putCacheRef
+        writeIORef putCacheRef Map.empty
+    }
+
+  where
+    -- Map lookup assuming existence of an associated value
+    confidentLookup :: Ord k => k -> Map k v -> v
+    confidentLookup key map
+      | Map.size map == 1 = Map.elems map !! 0
+      | otherwise = fromJust $ Map.lookup key map
+
+viewTop :: Expr' -> Html
+viewTop expr' =
+    div_ []
+      [ link_ [ rel_ "stylesheet", href_ "../../../main.css" ]
+      , viewExpr' id expr'
+      , text " = "
+      , text . toMisoString . show $ eval (base expr')
+      ]
+
+viewExpr' :: Nestle Expr' Expr' -> Expr' -> Html
+
+viewExpr' nestle literal'@(Literal' x _) =
+  span_ [ class_ "number" ]
+    [ input_ [ type_ "number"
+             , value_ (toMisoString . show $ (round x :: Int))
+             , onChange (\str -> nestle $ \_model -> Literal' (read $ fromMisoString str) Changed)
+             ]
+    , text " "
+    , button_ [ onClick (nestle $ \model -> Operation' model (Add' Changed) model Changed) ] [] -- TODO: repositioning
+    ]
+
+viewExpr' nestle operation'@(Operation' lhs' op' rhs' _) =
+  html where
+    html = span_ [ class_ "parens" ] [ lhsHtml, text " ", opHtml, text " ", rhsHtml ]
+
+    lhsHtml = lhs' & viewExpr' (\step -> nestle $ \(Operation' l o r _) -> Operation' (step l) (same o) (same r) Changed)
+    opHtml  = op'  & viewOp'   (\step -> nestle $ \(Operation' l o r _) -> Operation' (same l) (step o) (same r) Changed)
+    rhsHtml = rhs' & viewExpr' (\step -> nestle $ \(Operation' l o r _) -> Operation' (same l) (same o) (step r) Changed)
+
+viewOp' :: Nestle Op' Expr' -> Op' -> Html
+viewOp' nestle op' =
+  select_
+    [ onChange (\str -> nestle $ \_model -> unstringify str) ]
+    ([Add, Sub, Mul, Div] <&> \op ->
+      option_ [ selected_ (op == base op')
+              , value_ (stringify op)
+              ]
+              [ text . stringify $ op ])
+  where
+    stringify :: Op -> MisoString
+    stringify = (toMisoString :: String -> MisoString) <$> \case
+      Add -> "+"
+      Sub -> "-"
+      Mul -> "×"
+      Div -> "÷"
+
+    unstringify :: MisoString -> Op'
+    unstringify s = case fromMisoString s :: String of
+      "+" -> Add' Changed
+      "-" -> Sub' Changed
+      "×" -> Mul' Changed
+      "÷" -> Div' Changed

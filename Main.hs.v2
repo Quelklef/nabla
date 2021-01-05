@@ -1,0 +1,224 @@
+{-
+
+N.B.
+
+This version is WORKING.
+
+Implementation: to each node in the model ADT, affix a 'Maybe HTML'
+which holds the rendered HTML from the last 'view' call.
+
+Pros:
+ - it works
+ - it works nicely with recursive structures such as binary trees
+
+Cons:
+ - it *only* works on the special case of view functions being
+   exactly a function '(Sub)Model -> HTML', i.e. a function ONLY
+   of a/the (sub)model. This restriction (is because we|allows us to)
+   store the cached HTML on the Model ADT itself.
+
+-}
+
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ExplicitForAll #-}
+{-# LANGUAGE LambdaCase #-}
+
+module Main where
+
+import Data.Functor ((<&>))
+import Data.Function (on, (&))
+import Data.Maybe (isJust)
+
+import Miso hiding (on)
+import Miso.String
+
+import Debug.Trace
+
+data Expr = Literal Int | Operation Expr Op Expr deriving (Show, Eq)
+data Op = Add | Sub | Mul | Div deriving (Show, Eq)
+
+eval :: Expr -> Float
+eval (Literal x) = fromIntegral x
+eval (Operation lhs op rhs) = (eval lhs) `fun` (eval rhs)
+  where fun = case op of
+          Add -> (+)
+          Sub -> (-)
+          Mul -> (*)
+          Div -> (/)
+
+type Step a = a -> a
+type Nestle there here = Step here -> Step there
+type Html = View (Step Expr')
+
+data Expr'
+  = Literal' Int (Maybe Html)
+  | Operation' Expr' Op' Expr' (Maybe Html)
+
+data Op'
+  = Add' (Maybe Html)
+  | Sub' (Maybe Html)
+  | Mul' (Maybe Html)
+  | Div' (Maybe Html)
+
+class Inj to from where
+  from :: from -> to
+
+instance Inj Expr Expr' where
+  from (Literal' x _) = Literal x
+  from (Operation' lhs' op' rhs' _) = Operation (from lhs') (from op') (from rhs')
+
+instance Inj Op Op' where
+  from (Add' _) = Add
+  from (Sub' _) = Sub
+  from (Mul' _) = Mul
+  from (Div' _) = Div
+
+class Nabla nabla where
+  see :: nabla -> Maybe Html
+
+class (Nabla nabla, Inj base nabla) => NablaFor base nabla
+
+see_ :: Nabla nabla => nabla -> Html
+see_ = see <&> \case (Just html) -> html
+
+instance Nabla Expr' where
+  see (Literal' _ html) = html
+  see (Operation' _ _ _ html) = html
+
+instance NablaFor Expr Expr'
+
+instance Nabla Op' where
+  see (Add' html) = html
+  see (Sub' html) = html
+  see (Mul' html) = html
+  see (Div' html) = html
+
+instance NablaFor Op Op'
+
+instance Show Expr' where
+  show expr' = withCachedness expr' $ case expr' of
+    Literal' x _ -> "Literal' " <> show x
+    Operation' lhs' op' rhs' _ -> "Operation' " <> show lhs' <> " " <> show op' <> " " <> show rhs'
+
+instance Show Op' where
+  show op' = withCachedness op' $ case op' of
+    Add' _ -> "Add'"
+    Sub' _ -> "Sub'"
+    Mul' _ -> "Mul'"
+    Div' _ -> "Div'"
+
+withCachedness :: forall base nabla. (Nabla nabla, Show nabla) => nabla -> String -> String
+withCachedness nabla shown = "[" <> shown <> " :" <> htmlInfo <> "]"
+    where htmlInfo = case see nabla of
+            Nothing -> "✗"
+            Just _ -> "✓"
+
+instance Eq Expr' where
+  (==) = nablaEq @Expr
+
+instance Eq Op' where
+  (==) = nablaEq @Op
+
+nablaEq :: forall base nabla. (NablaFor base nabla, Eq base) => nabla -> nabla -> Bool
+nablaEq = (==) `on` (from :: nabla -> base)
+
+main :: IO ()
+main = startApp App
+  { initialAction = id
+  , model = initialModel
+  , update = \step model -> return (traceShowId $ step model)
+  , view = see_
+  , events = defaultEvents
+  , subs = []
+  , mountPoint = Nothing
+  , logLevel = Off
+  }
+  where
+    initialModel :: Expr'
+    initialModel = mkLiteral' template 0
+
+    template :: Nestle Expr' Expr'
+    template step model =
+      case expr' of
+        Literal' x html -> Literal' x (wrap <$> html)
+        Operation' lhs' op' rhs' html -> Operation' lhs' op' rhs' (wrap <$> html)
+
+      where
+        expr' = step model
+        wrap content =
+          div_ []
+            [ link_ [ rel_ "stylesheet", href_ "../../../main.css" ]
+            , content
+            , text " = "
+            , text . toMisoString . show . eval $ (from expr' :: Expr)
+            ]
+
+mkLiteral' :: Nestle Expr' Expr' -> Int -> Expr'
+mkLiteral' nestle x = Literal' x (Just html)
+  where
+    html =
+      span_ [ class_ "number" ]
+        [ input_ [ type_ "number"
+                 , value_ (toMisoString $ show x)
+                 , onChange (\text -> nestle $ \_m -> (mkLiteral' nestle . read . fromMisoString $ text))
+                 ]
+        , text " "
+        , let
+            clickHandler = nestle $ \m -> mkOperation' nestle (repositionExpr' lhsNestle m) (mkOp' opNestle Add) (repositionExpr' rhsNestle m)
+            opNestle = \step -> nestle $ \(Operation' l o r _h) -> mkOperation' nestle l (step o) r
+            lhsNestle = \step -> nestle $ \(Operation' l o r _h) -> mkOperation' nestle (step l) o r
+            rhsNestle = \step -> nestle $ \(Operation' l o r _h) -> mkOperation' nestle l o (step r)
+          in button_ [ onClick clickHandler ] []
+        ]
+
+repositionExpr' :: Nestle Expr' Expr' -> Expr' -> Expr'
+repositionExpr' nestle (Literal' x _) = mkLiteral' nestle x
+repositionExpr' nestle (Operation' l o r _) = mkOperation' nestle (repositionExpr' lhsNestle l) (repositionOp' opNestle o) (repositionExpr' rhsNestle r)
+  where
+    opNestle = \step -> nestle $ \(Operation' l o r _) -> mkOperation' nestle l (step o) r
+    lhsNestle = \step -> nestle $ \(Operation' l o r _) -> mkOperation' nestle (step l) o r
+    rhsNestle = \step -> nestle $ \(Operation' l o r _) -> mkOperation' nestle l o (step r)
+
+repositionOp' :: Nestle Expr' Op' -> Op' -> Op'
+repositionOp' nestle op' = mkOp' nestle (from op' :: Op)
+
+mkOperation' :: Nestle Expr' Expr' -> Expr' -> Op' -> Expr' -> Expr'
+mkOperation' nestle lhs' op' rhs' = Operation' lhs' op' rhs' (Just html)
+  where html = span_ [ class_ "parens" ] [ see_ lhs', text " ", see_ op', text " ", see_ rhs' ]
+
+mkOp' :: Nestle Expr' Op' -> Op -> Op'
+mkOp' nestle op =
+  case op of
+    Add -> Add' (Just html)
+    Sub -> Sub' (Just html)
+    Mul -> Mul' (Just html)
+    Div -> Div' (Just html)
+  where
+    html =
+      select_
+        [ onChange (\text -> nestle $ \_ -> unstringify $ fromMisoString text) ]
+        ([Add, Sub, Mul, Div] <&> \thisOp ->
+          option_ [ selected_ (thisOp == op)
+                  , value_ (toMisoString $ stringify thisOp)
+                  ]
+                  [ text . toMisoString . stringify $ thisOp ])
+      where
+        stringify :: Op -> String
+        stringify = \case
+          Add -> "+"
+          Sub -> "-"
+          Mul -> "×"
+          Div -> "÷"
+
+        unstringify :: String -> Op'
+        unstringify = \case
+          "+" -> mkOp' nestle Add
+          "-" -> mkOp' nestle Sub
+          "×" -> mkOp' nestle Mul
+          "÷" -> mkOp' nestle Div

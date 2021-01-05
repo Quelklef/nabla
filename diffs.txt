@@ -1,0 +1,21 @@
+Consider the case of expressing e.g. a game as a pair of functions
+
+  render :: state -> Picture
+  react :: UserAction -> state -> state
+
+A naiive implementation of this would be incredibly slow, since it would completely re-render each time.
+A common solution to this is to have the render function return a 'lightweight' representation of what it is actually supposed to be returned, which is then diffed to produce the actual output. Example: virtual DOM.
+However, a solution that would be faster and way cooler would be as follows: consider the game loop
+
+  mainLoop state = do
+    userActions <- getUserActions
+    let state' = react userActions state
+    let picture = render state'
+    draw picture
+    mainLoop state'
+
+We could internally represent state' as the pair (state,dState) where where dState is a delta representing the differences between state and state'.
+Then, when calling `render state'`, referential transparency allows us to re-use the result from last time on any subcomponents of state' which have not changed.
+And representing state' as a delta from state allows us to efficiently tell which subcomponents have and have not changed.
+
+By the way, the idea of a 'subcomponent' would probably be reified by leaning heavily on ADTs
